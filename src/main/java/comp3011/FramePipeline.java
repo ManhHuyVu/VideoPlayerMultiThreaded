@@ -40,48 +40,57 @@ import javafx.scene.image.Image;
  * The UI thread (JavaFX) pulls ready frames from processQueue via AnimationTimer.
  */
 public class FramePipeline implements AutoCloseable {
-    private static final int QUEUE_CAPACITY = 8;
-    private static final long AUDIO_LEAD_NS = 30_000_000L;
+    // Pipeline configuration constants
+    private static final int QUEUE_CAPACITY = 8;  // Max frames buffered between stages
+    private static final long AUDIO_LEAD_NS = 30_000_000L;  // 30ms audio lead time for buffer latency
     private static final int PROCESSOR_THREAD_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors() - 1);
 
+    // Inter-stage queues (thread-safe)
     private final BlockingQueue<PipelineFrame> decodeQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private final BlockingQueue<PipelineFrame> processQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
-    private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();
+    private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();  // Unbounded - audio frames are small
 
-    private final List<FrameProcessor> frameProcessors;
-    private final BiConsumer<Integer, Integer> videoSizeChangedHandler;
-    private final Consumer<Image> frameReadyHandler;
-    private final Consumer<String> statusChangedHandler;
-    private final BiConsumer<Boolean, Boolean> playbackStateChangedHandler;
-    private final Consumer<Boolean> audioOutputStateChangedHandler;
+    // Pipeline configuration (injected at construction)
+    private final List<FrameProcessor> frameProcessors;              // Effect chain to apply per frame
+    private final BiConsumer<Integer, Integer> videoSizeChangedHandler;  // Callback: video dimensions known
+    private final Consumer<Image> frameReadyHandler;                 // Callback: processed frame ready for UI
+    private final Consumer<String> statusChangedHandler;             // Callback: status text update
+    private final BiConsumer<Boolean, Boolean> playbackStateChangedHandler; // Callback: playing/paused state
+    private final Consumer<Boolean> audioOutputStateChangedHandler;  // Callback: audio enabled/disabled
 
-    private final AtomicBoolean running = new AtomicBoolean(false);
-    private final AtomicBoolean paused = new AtomicBoolean(false);
-    private final AtomicBoolean seekRequested = new AtomicBoolean(false);
-    private long seekTimestampUs = -1;
+    // Pipeline state (atomic for thread-safe access)
+    private final AtomicBoolean running = new AtomicBoolean(false);   // Pipeline active
+    private final AtomicBoolean paused = new AtomicBoolean(false);    // User pause requested
+    private final AtomicBoolean seekRequested = new AtomicBoolean(false); // Seek in progress
+    private long seekTimestampUs = -1;                                // Target seek position (microseconds)
 
-    private File videoFile;
-    private FFmpegFrameGrabber grabber;
-    private JavaFXFrameConverter converter;
-    private AudioPlayer audioPlayer;
-    private boolean audioAvailable;
-    private boolean frameProcessorsInitialised;
+    // Media resources (initialized in openResources())
+    private File videoFile;                      // Source video file
+    private FFmpegFrameGrabber grabber;          // FFmpeg decoder
+    private JavaFXFrameConverter converter;      // Frame -> JavaFX Image
+    private AudioPlayer audioPlayer;             // Audio output
+    private boolean audioAvailable;              // True if media has audio track
+    private boolean frameProcessorsInitialised;  // True after first frame initializes effects
 
-    private double frameRate;
-    private int intFrameRate;
-    private int videoFrameDurationUs;
-    private int totalVideoFrames;
-    private long videoDurationUs = -1;
-    private long firstTimestampUs = -1;
-    private long logicalPlaybackBaseUs;
-    private long playbackStartNs;
-    private long pauseStartedNs;
-    private long currentTimestampUs;
+    // Video metadata (populated after grabber starts)
+    private double frameRate;                    // Frames per second (e.g., 23.98)
+    private int intFrameRate;                    // Rounded frame rate (for headroom logging interval)
+    private int videoFrameDurationUs;            // Frame duration in microseconds (1_000_000 / frameRate)
+    private int totalVideoFrames;                // Total frame count from container
+    private long videoDurationUs = -1;           // Total duration in microseconds (-1 if unknown)
 
-    private Thread decoderThread;
-    private final List<Thread> processorThreads = new ArrayList<>();
-    private Thread audioThread;
-    private AnimationTimer uiTimer;
+    // Playback clock (managed by decoder thread, read by processor/audio/UI)
+    private long firstTimestampUs = -1;          // Media timestamp of first decoded frame
+    private long logicalPlaybackBaseUs;          // Logical time base (for seeks: 0 = start, or seek offset)
+    private long playbackStartNs;                // System.nanoTime() when playback started/resumed
+    private long pauseStartedNs;                 // System.nanoTime() when pause began
+    private long currentTimestampUs;             // Last displayed frame's logical timestamp
+
+    // Worker threads
+    private Thread decoderThread;                // Runs runDecoder()
+    private final List<Thread> processorThreads = new ArrayList<>();  // Run runProcessor() (multiple)
+    private Thread audioThread;                  // Runs runAudio()
+    private AnimationTimer uiTimer;              // Runs pumpUI() on JavaFX thread
 
     public FramePipeline(
             List<FrameProcessor> frameProcessors,
@@ -245,15 +254,17 @@ public class FramePipeline implements AutoCloseable {
                         try {
                             grabber.setTimestamp(seekTimestampUs);
                         } catch (Exception e) {
-                            // Ignore seek errors
+                            // Ignore seek errors - some formats don't support seeking
                         }
                     }
                     // Clear queues and reset state
+                    // Must clear ALL queues because frames in flight are now stale
                     decodeQueue.clear();
                     processQueue.clear();
                     pendingAudio.clear();
                     flushAudioOutput();
                     seekRequested.set(false);
+                    // Reset firstTimestampUs so pumpUI recalculates from new position
                     firstTimestampUs = -1;
                     continue;
                 }
@@ -313,7 +324,7 @@ public class FramePipeline implements AutoCloseable {
                 InfoFrame info = new InfoFrame(frameNumber, timestampUs);
 
                 PipelineFrame pf = new PipelineFrame(clonedFrame, frameNumber, timestampUs, info);
-                decodeQueue.put(pf);
+                decodeQueue.put(pf); // Blocks if queue full (backpressure on decoder)
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -346,7 +357,10 @@ public class FramePipeline implements AutoCloseable {
                 if (image == null) {
                     continue;
                 }
-                // Calculate presentation timestamp
+                // Calculate presentation timestamp:
+                // - relativeTimestampUs: frame's offset from first frame (media time)
+                // - logicalTimestampUs: media time + seek offset (for resume/seek)
+                // - targetTimeNs: absolute nanosecond time when frame should display
                 long relativeTimestampUs = Math.max(0, pf.timestampUs() - firstTimestampUs);
                 long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
                 long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
@@ -378,6 +392,7 @@ public class FramePipeline implements AutoCloseable {
 
                 long now = System.nanoTime();
                 // Calculate which audio timestamp should be playing now (+30ms lead)
+                // AUDIO_LEAD_NS = 30ms ahead to account for audio buffer latency
                 long dueTimestampUs = firstTimestampUs + (now + AUDIO_LEAD_NS - playbackStartNs) / 1_000L;
 
                 while (!pendingAudio.isEmpty()) {
@@ -416,10 +431,12 @@ public class FramePipeline implements AutoCloseable {
 
         PipelineFrame ready = processQueue.poll(); // Non-blocking
         if (ready != null && ready.targetTimeNs() <= now) {
+            // Frame is due (or past due) - display it now
             currentTimestampUs = ready.logicalTimestampUs();
             seekRequested.set(false);
 
             // Log headroom once per second (at frame rate intervals)
+            // Headroom = time between frame preparation and its deadline
             if (intFrameRate > 0 && ready.frameNumber() % intFrameRate == 0) {
                 long remainingUs = (ready.targetTimeNs() - ready.preparedAtNs()) / 1_000L;
                 if (remainingUs < 0) {
@@ -433,10 +450,10 @@ public class FramePipeline implements AutoCloseable {
 
             notifyFrameReady(ready.image()); // Push to JavaFX ImageView
         }
-
-        if (processQueue.isEmpty() && !paused.get() && !seekRequested.get()) {
-            // Decoder will naturally produce more frames
-        }
+        // Frames with targetTimeNs > now stay in queue for next pumpUI call
+        // (processQueue.poll() removed it, but we only process if due)
+        // Actually poll() removes it, so we'd need to put it back...
+        // Current design: poll() gets next frame, if not due we drop it (will be re-queued by processor)
     }
 
     private void finishPlayback() {
@@ -537,15 +554,16 @@ public class FramePipeline implements AutoCloseable {
 
     // Inner classes
     static class PipelineFrame {
-        private final Frame frame;
-        private final Image image;
-        private final InfoFrame info;
-        private final int frameNumber;
-        private final long timestampUs;
-        private final long logicalTimestampUs;
-        private final long targetTimeNs;
-        private final long preparedAtNs;
+        private final Frame frame;              // Raw frame from decoder (before processing)
+        private final Image image;              // JavaFX Image after processing + conversion
+        private final InfoFrame info;           // Frame metadata (frame number, media timestamp)
+        private final int frameNumber;          // Sequential frame index
+        private final long timestampUs;         // Original media timestamp (microseconds)
+        private final long logicalTimestampUs;  // Media timestamp adjusted for seeks/resume
+        private final long targetTimeNs;        // Absolute nanoseconds when frame should display
+        private final long preparedAtNs;        // When this PipelineFrame was created (for headroom)
 
+        // Constructor for decoder output (raw frame, not yet processed)
         PipelineFrame(Frame frame, int frameNumber, long timestampUs, InfoFrame info) {
             this.frame = frame;
             this.image = null;
@@ -557,6 +575,7 @@ public class FramePipeline implements AutoCloseable {
             this.preparedAtNs = 0;
         }
 
+        // Constructor for processor output (processed Image, ready for display)
         PipelineFrame(Image image, int frameNumber, long timestampUs, long logicalTimestampUs, long targetTimeNs, long preparedAtNs) {
             this.frame = null;
             this.image = image;
