@@ -91,11 +91,11 @@ public class CommandLineController {
             } else if ("-2".equals(arg) || "--monitor-2".equals(arg)) {
                 setDisplayId(2);
             } else if (arg.startsWith("--")) {
-                parseLongOption(arg);
+                parseLongOption(arg); // --long-option
             } else if (arg.startsWith("-")) {
-                parseShortOptions(arg);
+                parseShortOptions(arg); // -abc (stacked)
             } else {
-                videoFiles.add(arg);
+                videoFiles.add(arg); // Positional: video file
             }
         }
 
@@ -168,6 +168,7 @@ public class CommandLineController {
                 break;
             }
         }
+        // Supports stacked: -nssnfwyvdjmbp
     }
 
     private void setDisplayId(int displayId) {
