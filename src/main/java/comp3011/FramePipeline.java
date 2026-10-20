@@ -121,10 +121,12 @@ public class FramePipeline implements AutoCloseable {
     }
 
     public void backFiveSeconds() {
+        if (videoFile == null) return;
         seekRelative(-5_000_000L);
     }
 
     public void forwardFiveSeconds() {
+        if (videoFile == null) return;
         seekRelative(5_000_000L);
     }
 
@@ -147,6 +149,10 @@ public class FramePipeline implements AutoCloseable {
 
     public void toggleAudioOutput() {
         // Audio output toggle handled by model level
+    }
+
+    public boolean isAudioOutputEnabled() {
+        return true; // Default, Model delegates here
     }
 
     public void stop() {
@@ -177,7 +183,7 @@ public class FramePipeline implements AutoCloseable {
         paused.set(initiallyPaused);
         logicalPlaybackBaseUs = initialSeekBaseUs != -1 ? initialSeekBaseUs : startTimestampUs;
         firstTimestampUs = -1;
-        playbackStartNs = 0;
+        playbackStartNs = System.nanoTime(); // Set clock start immediately
         pauseStartedNs = initiallyPaused ? System.nanoTime() : 0;
         frameProcessorsInitialised = false;
 
@@ -264,8 +270,11 @@ public class FramePipeline implements AutoCloseable {
                     pendingAudio.clear();
                     flushAudioOutput();
                     seekRequested.set(false);
-                    // Reset firstTimestampUs so pumpUI recalculates from new position
+                    // Reset clock for new position
                     firstTimestampUs = -1;
+                    playbackStartNs = System.nanoTime();
+                    logicalPlaybackBaseUs = seekTimestampUs;
+                    pauseStartedNs = 0;
                     continue;
                 }
 
@@ -429,9 +438,10 @@ public class FramePipeline implements AutoCloseable {
             return;
         }
 
-        PipelineFrame ready = processQueue.poll(); // Non-blocking
+        PipelineFrame ready = processQueue.peek(); // Non-blocking, don't remove
         if (ready != null && ready.targetTimeNs() <= now) {
             // Frame is due (or past due) - display it now
+            processQueue.poll(); // Remove now that we're using it
             currentTimestampUs = ready.logicalTimestampUs();
             seekRequested.set(false);
 
@@ -451,9 +461,6 @@ public class FramePipeline implements AutoCloseable {
             notifyFrameReady(ready.image()); // Push to JavaFX ImageView
         }
         // Frames with targetTimeNs > now stay in queue for next pumpUI call
-        // (processQueue.poll() removed it, but we only process if due)
-        // Actually poll() removes it, so we'd need to put it back...
-        // Current design: poll() gets next frame, if not due we drop it (will be re-queued by processor)
     }
 
     private void finishPlayback() {
