@@ -99,18 +99,240 @@ public class FramePipeline implements AutoCloseable {
         this.audioOutputStateChangedHandler = audioOutputStateChangedHandler;
     }
 
-    public void play(File file) { /* TODO */ }
-    public void startOver() { /* TODO */ }
-    public void backFiveSeconds() { /* TODO */ }
-    public void forwardFiveSeconds() { /* TODO */ }
-    public void togglePause() { /* TODO */ }
-    public void toggleAudioOutput() { /* TODO */ }
-    public void stop() { /* TODO */ }
-    public void shutdown() { /* TODO */ }
+    public void play(File file) {
+        stop();
+        videoFile = file;
+        videoDurationUs = -1;
+        startPipeline(0, false, -1);
+    }
+
+    public void startOver() {
+        if (videoFile == null) return;
+        seekTo(0);
+    }
+
+    public void backFiveSeconds() {
+        seekRelative(-5_000_000L);
+    }
+
+    public void forwardFiveSeconds() {
+        seekRelative(5_000_000L);
+    }
+
+    public void togglePause() {
+        if (!running.get()) {
+            if (videoFile != null) {
+                startPipeline(0, false, 0);
+            }
+            return;
+        }
+        boolean newPause = !paused.getAndSet(!paused.get());
+        if (newPause) {
+            pauseStartedNs = System.nanoTime();
+            flushAudioOutput();
+        } else {
+            resumePlaybackClock(System.nanoTime());
+        }
+        notifyPlaybackStateChanged();
+    }
+
+    public void toggleAudioOutput() {
+        // Audio output toggle handled by model level
+    }
+
+    public void stop() {
+        stopPipeline();
+    }
+
+    public void shutdown() {
+        stopPipeline();
+    }
+
+    private void seekRelative(long offsetUs) {
+        if (videoFile == null) return;
+        long base = firstTimestampUs != -1 ? firstTimestampUs : 0;
+        seekTo(base + offsetUs);
+    }
+
+    private void seekTo(long timestampUs) {
+        seekTimestampUs = Math.max(0, timestampUs);
+        seekRequested.set(true);
+    }
 
     @Override
     public void close() {
         shutdown();
+    }
+
+    private void startPipeline(long startTimestampUs, boolean initiallyPaused, long initialSeekBaseUs) {
+        paused.set(initiallyPaused);
+        logicalPlaybackBaseUs = initialSeekBaseUs != -1 ? initialSeekBaseUs : startTimestampUs;
+        firstTimestampUs = -1;
+        playbackStartNs = 0;
+        pauseStartedNs = initiallyPaused ? System.nanoTime() : 0;
+        frameProcessorsInitialised = false;
+
+        notifyStatusChanged(videoFile.getName());
+
+        try {
+            openResources(startTimestampUs);
+            running.set(true);
+            startThreads();
+            notifyPlaybackStateChanged();
+        } catch (Exception e) {
+            handleError(e);
+        }
+    }
+
+    private void openResources(long startTimestampUs) throws Exception {
+        converter = new JavaFXFrameConverter();
+        grabber = new FFmpegFrameGrabber(videoFile);
+        grabber.setImageMode(FrameGrabber.ImageMode.COLOR);
+        grabber.setSampleMode(FrameGrabber.SampleMode.SHORT);
+        grabber.start();
+
+        notifyVideoSizeChanged(grabber.getImageWidth(), grabber.getImageHeight());
+
+        frameRate = grabber.getFrameRate();
+        intFrameRate = (int) Math.round(frameRate);
+        videoFrameDurationUs = frameRate > 0 ? (int) Math.round(1_000_000.0 / frameRate) : 0;
+        totalVideoFrames = grabber.getLengthInVideoFrames();
+
+        long durationUs = grabber.getLengthInTime();
+        videoDurationUs = durationUs > 0 ? durationUs : -1;
+
+        audioAvailable = grabber.hasAudio();
+        audioPlayer = new AudioPlayer();
+        if (audioAvailable) {
+            audioPlayer.open(grabber.getSampleRate(), grabber.getAudioChannels());
+        }
+
+        if (startTimestampUs > 0) {
+            grabber.setTimestamp(startTimestampUs);
+        }
+    }
+
+    private void startThreads() {
+        decoderThread = new Thread(this::runDecoder, "VideoDecoder");
+        
+        for (int i = 0; i < PROCESSOR_THREAD_COUNT; i++) {
+            Thread t = new Thread(this::runProcessor, "VideoProcessor-" + i);
+            processorThreads.add(t);
+            t.start();
+        }
+        
+        audioThread = new Thread(this::runAudio, "AudioWriter");
+        uiTimer = new AnimationTimer() {
+            @Override
+            public void handle(long now) {
+                pumpUI(now);
+            }
+        };
+
+        decoderThread.start();
+        if (audioAvailable) {
+            audioThread.start();
+        }
+        uiTimer.start();
+    }
+
+    private void runDecoder() {
+        try {
+            while (running.get() && !Thread.currentThread().isInterrupted()) {
+                if (paused.get() || seekRequested.get()) {
+                    Thread.sleep(10);
+                    continue;
+                }
+
+                Frame frame = audioAvailable ? grabber.grab() : grabber.grabImage();
+                if (frame == null) {
+                    finishPlayback();
+                    break;
+                }
+
+                long timestampUs = grabber.getTimestamp();
+
+                if (audioAvailable && frame.samples != null) {
+                    byte[] samples = audioPlayer.copySamples(frame);
+                    if (samples.length > 0) {
+                        pendingAudio.add(new PendingAudio(timestampUs, samples));
+                    }
+                }
+
+                if (frame.image == null) {
+                    continue;
+                }
+
+                Frame clonedFrame = frame.clone();
+
+                if (!frameProcessorsInitialised) {
+                    initialiseFrameProcessors(new InfoVideo(
+                            mediaName(videoFile),
+                            totalVideoFrames,
+                            clonedFrame.imageWidth,
+                            clonedFrame.imageHeight,
+                            clonedFrame.imageDepth,
+                            clonedFrame.imageChannels,
+                            clonedFrame.imageStride,
+                            frameRate,
+                            intFrameRate,
+                            videoFrameDurationUs,
+                            grabber.getPixelFormat()));
+                    frameProcessorsInitialised = true;
+                }
+
+                if (firstTimestampUs == -1) {
+                    firstTimestampUs = timestampUs;
+                    playbackStartNs = System.nanoTime();
+                    if (paused.get()) {
+                        pauseStartedNs = playbackStartNs;
+                    }
+                }
+
+                int frameNumber = grabber.getFrameNumber();
+                InfoFrame info = new InfoFrame(frameNumber, timestampUs);
+
+                PipelineFrame pf = new PipelineFrame(clonedFrame, frameNumber, timestampUs, info);
+                decodeQueue.put(pf);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            if (running.get()) {
+                Platform.runLater(() -> handleError(e));
+            }
+        }
+    }
+
+    // Stubs for methods referenced by decoder - will be implemented in later stages
+    private void runProcessor() { /* TODO */ }
+    private void runAudio() { /* TODO */ }
+    private void pumpUI(long now) { /* TODO */ }
+    private void finishPlayback() { /* TODO */ }
+    private void handleError(Exception e) { /* TODO */ }
+    private void flushAudioOutput() { if (audioPlayer != null) audioPlayer.flush(); }
+    private void resumePlaybackClock(long now) {
+        if (pauseStartedNs > 0 && playbackStartNs > 0) {
+            playbackStartNs += now - pauseStartedNs;
+        }
+        pauseStartedNs = 0;
+    }
+    private void notifyPlaybackStateChanged() {
+        playbackStateChangedHandler.accept(running.get(), paused.get());
+    }
+    private void stopPipeline() { /* TODO */ }
+    private void notifyStatusChanged(String status) { statusChangedHandler.accept(status); }
+    private void notifyVideoSizeChanged(int width, int height) { videoSizeChangedHandler.accept(width, height); }
+    private void initialiseFrameProcessors(InfoVideo videoInfo) throws Exception {
+        for (FrameProcessor processor : frameProcessors) {
+            processor.initialise(videoInfo);
+        }
+    }
+    private String mediaName(File file) {
+        String fileName = file.getName();
+        int extensionStart = fileName.lastIndexOf('.');
+        if (extensionStart <= 0) return fileName;
+        return fileName.substring(0, extensionStart);
     }
 
     // Inner classes
