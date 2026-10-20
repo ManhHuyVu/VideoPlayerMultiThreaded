@@ -150,7 +150,7 @@ public class FramePipeline implements AutoCloseable {
 
     private void seekRelative(long offsetUs) {
         if (videoFile == null) return;
-        long base = firstTimestampUs != -1 ? firstTimestampUs : 0;
+        long base = currentTimestampUs;
         seekTo(base + offsetUs);
     }
 
@@ -239,14 +239,33 @@ public class FramePipeline implements AutoCloseable {
     private void runDecoder() {
         try {
             while (running.get() && !Thread.currentThread().isInterrupted()) {
-                if (paused.get() || seekRequested.get()) {
-                    Thread.sleep(10);
+                if (seekRequested.get()) {
+                    // Perform the actual seek on the grabber
+                    if (grabber != null && seekTimestampUs >= 0) {
+                        try {
+                            grabber.setTimestamp(seekTimestampUs);
+                        } catch (Exception e) {
+                            // Ignore seek errors
+                        }
+                    }
+                    // Clear queues and reset state
+                    decodeQueue.clear();
+                    processQueue.clear();
+                    pendingAudio.clear();
+                    flushAudioOutput();
+                    seekRequested.set(false);
+                    firstTimestampUs = -1;
+                    continue;
+                }
+
+                if (paused.get()) {
+                    Thread.sleep(10); // Yield while paused
                     continue;
                 }
 
                 Frame frame = audioAvailable ? grabber.grab() : grabber.grabImage();
                 if (frame == null) {
-                    finishPlayback();
+                    finishPlayback(); // EOF
                     break;
                 }
 
@@ -260,9 +279,10 @@ public class FramePipeline implements AutoCloseable {
                 }
 
                 if (frame.image == null) {
-                    continue;
+                    continue; // Audio-only frame
                 }
 
+                // Clone frame because grabber reuses the same Frame object
                 Frame clonedFrame = frame.clone();
 
                 if (!frameProcessorsInitialised) {
@@ -304,12 +324,193 @@ public class FramePipeline implements AutoCloseable {
         }
     }
 
-    // Stubs for methods referenced by decoder - will be implemented in later stages
-    private void runProcessor() { /* TODO */ }
-    private void runAudio() { /* TODO */ }
-    private void pumpUI(long now) { /* TODO */ }
-    private void finishPlayback() { /* TODO */ }
-    private void handleError(Exception e) { /* TODO */ }
+    private void runProcessor() {
+        try {
+            while (running.get() && !Thread.currentThread().isInterrupted()) {
+                PipelineFrame pf = decodeQueue.take(); // Blocks until frame available
+                if (!running.get()) break;
+
+                Frame frame = pf.frame();
+                InfoFrame info = pf.info();
+
+                if (frame.image == null || frame.imageWidth <= 0 || frame.imageHeight <= 0 || frame.imageChannels != 3) {
+                    continue; // Skip invalid frames
+                }
+
+                // Apply all frame processors in sequence
+                for (FrameProcessor processor : frameProcessors) {
+                    processor.process(frame, info);
+                }
+
+                Image image = converter.convert(frame);
+                if (image == null) {
+                    continue;
+                }
+                // Calculate presentation timestamp
+                long relativeTimestampUs = Math.max(0, pf.timestampUs() - firstTimestampUs);
+                long logicalTimestampUs = logicalPlaybackBaseUs + relativeTimestampUs;
+                long targetTimeNs = playbackStartNs + relativeTimestampUs * 1_000L;
+
+                PipelineFrame ready = new PipelineFrame(
+                        image,
+                        pf.frameNumber(),
+                        pf.timestampUs(),
+                        logicalTimestampUs,
+                        targetTimeNs,
+                        System.nanoTime());
+                processQueue.put(ready); // Blocks if queue full (backpressure)
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            if (running.get()) {
+                Platform.runLater(() -> handleError(e));
+            }
+        }
+    }
+    private void runAudio() {
+        try {
+            while (running.get() && !Thread.currentThread().isInterrupted()) {
+                if (paused.get() || firstTimestampUs == -1 || playbackStartNs <= 0) {
+                    Thread.sleep(5); // Wait for clock init
+                    continue;
+                }
+
+                long now = System.nanoTime();
+                // Calculate which audio timestamp should be playing now (+30ms lead)
+                long dueTimestampUs = firstTimestampUs + (now + AUDIO_LEAD_NS - playbackStartNs) / 1_000L;
+
+                while (!pendingAudio.isEmpty()) {
+                    PendingAudio audio = pendingAudio.peek();
+                    if (audio.timestampUs() > dueTimestampUs) {
+                        break; // Not yet due
+                    }
+
+                    int written = audioPlayer.write(audio.samples(), audio.offset(), audio.remaining());
+                    if (written <= 0) {
+                        break; // Buffer full
+                    }
+
+                    audio.advance(written);
+                    if (!audio.finished()) {
+                        break; // Partial write
+                    }
+                    pendingAudio.remove(); // Fully written
+                }
+
+                Thread.sleep(2); // Yield
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            if (running.get()) {
+                Platform.runLater(() -> handleError(e));
+            }
+        }
+    }
+
+    private void pumpUI(long now) {
+        if (!running.get()) {
+            return;
+        }
+
+        PipelineFrame ready = processQueue.poll(); // Non-blocking
+        if (ready != null && ready.targetTimeNs() <= now) {
+            currentTimestampUs = ready.logicalTimestampUs();
+            seekRequested.set(false);
+
+            // Log headroom once per second (at frame rate intervals)
+            if (intFrameRate > 0 && ready.frameNumber() % intFrameRate == 0) {
+                long remainingUs = (ready.targetTimeNs() - ready.preparedAtNs()) / 1_000L;
+                if (remainingUs < 0) {
+                    System.out.printf("Frame headroom is \u001B[31m%5dus\u001B[0m out of %dus spare.%n",
+                            remainingUs, videoFrameDurationUs);
+                } else {
+                    System.out.printf("Frame headroom is \u001B[32m%5dus\u001B[0m out of %dus spare.%n",
+                            remainingUs, videoFrameDurationUs);
+                }
+            }
+
+            notifyFrameReady(ready.image()); // Push to JavaFX ImageView
+        }
+
+        if (processQueue.isEmpty() && !paused.get() && !seekRequested.get()) {
+            // Decoder will naturally produce more frames
+        }
+    }
+
+    private void finishPlayback() {
+        long endTimestampUs = videoDurationUs != -1 ? videoDurationUs : currentTimestampUs;
+        stopPipeline();
+        paused.set(true);
+        currentTimestampUs = endTimestampUs;
+        notifyStatusChanged("Playback finished");
+        notifyPlaybackStateChanged();
+    }
+
+    private void handleError(Exception e) {
+        e.printStackTrace();
+        stopPipeline();
+        paused.set(false);
+        notifyStatusChanged("Error: " + e.getMessage());
+        notifyPlaybackStateChanged();
+    }
+
+    private void stopPipeline() {
+        running.set(false);
+        seekRequested.set(true); // Unblock any waiting threads
+
+        if (uiTimer != null) {
+            uiTimer.stop();
+            uiTimer = null;
+        }
+
+        if (decoderThread != null) {
+            decoderThread.interrupt();
+            try { decoderThread.join(1000); } catch (InterruptedException ignored) {}
+            decoderThread = null;
+        }
+        for (Thread t : processorThreads) {
+            t.interrupt();
+            try { t.join(1000); } catch (InterruptedException ignored) {}
+        }
+        processorThreads.clear();
+        if (audioThread != null) {
+            audioThread.interrupt();
+            try { audioThread.join(1000); } catch (InterruptedException ignored) {}
+            audioThread = null;
+        }
+
+        closeResources();
+    }
+
+    private void notifyFrameReady(Image image) { frameReadyHandler.accept(image); }
+
+    private void closeResources() {
+        decodeQueue.clear();
+        processQueue.clear();
+        pendingAudio.clear();
+        firstTimestampUs = -1;
+        playbackStartNs = 0;
+        pauseStartedNs = 0;
+        audioAvailable = false;
+        frameProcessorsInitialised = false;
+
+        if (audioPlayer != null) {
+            audioPlayer.close();
+            audioPlayer = null;
+        }
+        if (grabber != null) {
+            try { grabber.stop(); } catch (Exception ignored) {}
+            try { grabber.close(); } catch (Exception ignored) {}
+            grabber = null;
+        }
+        if (converter != null) {
+            converter.close();
+            converter = null;
+        }
+    }
+
     private void flushAudioOutput() { if (audioPlayer != null) audioPlayer.flush(); }
     private void resumePlaybackClock(long now) {
         if (pauseStartedNs > 0 && playbackStartNs > 0) {
@@ -320,7 +521,6 @@ public class FramePipeline implements AutoCloseable {
     private void notifyPlaybackStateChanged() {
         playbackStateChangedHandler.accept(running.get(), paused.get());
     }
-    private void stopPipeline() { /* TODO */ }
     private void notifyStatusChanged(String status) { statusChangedHandler.accept(status); }
     private void notifyVideoSizeChanged(int width, int height) { videoSizeChangedHandler.accept(width, height); }
     private void initialiseFrameProcessors(InfoVideo videoInfo) throws Exception {
