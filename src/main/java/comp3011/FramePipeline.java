@@ -101,7 +101,7 @@ public class FramePipeline implements AutoCloseable {
             Consumer<String> statusChangedHandler,
             BiConsumer<Boolean, Boolean> playbackStateChangedHandler,
             Consumer<Boolean> audioOutputStateChangedHandler) {
-        this.frameProcessors = frameProcessors;
+        this.frameProcessors = List.copyOf(frameProcessors); // Defensive copy, immutable after construction
         this.videoSizeChangedHandler = videoSizeChangedHandler;
         this.frameReadyHandler = frameReadyHandler;
         this.statusChangedHandler = statusChangedHandler;
