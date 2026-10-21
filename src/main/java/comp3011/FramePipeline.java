@@ -41,7 +41,7 @@ import javafx.scene.image.Image;
  */
 public class FramePipeline implements AutoCloseable {
     // Pipeline configuration constants
-    private static final int QUEUE_CAPACITY = 8;  // Max frames buffered between stages
+    private static final int QUEUE_CAPACITY = 16;  // Max frames buffered between stages
     private static final long AUDIO_LEAD_NS = 30_000_000L;  // 30ms audio lead time for buffer latency
     private static final int PROCESSOR_THREAD_COUNT = Math.max(2, Runtime.getRuntime().availableProcessors() - 1);
 
