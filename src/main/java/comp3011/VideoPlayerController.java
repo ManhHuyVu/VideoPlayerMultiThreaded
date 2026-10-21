@@ -90,6 +90,10 @@ public class VideoPlayerController {
         model.play(file);
     }
 
+    public void resume() {
+        model.play();
+    }
+
     public void shutdown() {
         model.shutdown();
     }

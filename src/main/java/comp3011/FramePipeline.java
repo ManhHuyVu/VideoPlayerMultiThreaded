@@ -116,6 +116,13 @@ public class FramePipeline implements AutoCloseable {
         startPipeline(0, false, -1);
     }
 
+    public void play() {
+        if (videoFile == null) return;
+        if (!running.get()) {
+            startPipeline(0, false, currentTimestampUs);
+        }
+    }
+
     public void startOver() {
         if (videoFile == null) return;
         seekTo(0);
@@ -134,7 +141,14 @@ public class FramePipeline implements AutoCloseable {
     public void togglePause() {
         if (!running.get()) {
             if (videoFile != null) {
-                startPipeline(0, false, 0);
+                // At EOF or stopped: restart from beginning instead of full pipeline restart
+                if (paused.get() && currentTimestampUs >= videoDurationUs && videoDurationUs > 0) {
+                    seekTo(0);
+                    paused.set(false);
+                    notifyPlaybackStateChanged();
+                } else {
+                    startPipeline(0, false, 0);
+                }
             }
             return;
         }
@@ -162,6 +176,9 @@ public class FramePipeline implements AutoCloseable {
 
     public void stop() {
         stopPipeline();
+        // Reset playback position tracking
+        currentTimestampUs = 0;
+        logicalPlaybackBaseUs = 0;
     }
 
     public void shutdown() {
@@ -258,7 +275,9 @@ public class FramePipeline implements AutoCloseable {
     }
 
     private void runDecoder() {
+        System.err.println("[Decoder] Thread started, audioAvailable=" + audioAvailable);
         try {
+            int frameCount = 0;
             while (running.get() && !Thread.currentThread().isInterrupted()) {
                 if (seekRequested.get()) {
                     // Perform the actual seek on the grabber
@@ -266,7 +285,8 @@ public class FramePipeline implements AutoCloseable {
                         try {
                             grabber.setTimestamp(seekTimestampUs);
                         } catch (Exception e) {
-                            // Ignore seek errors - some formats don't support seeking
+                            // Seek failed - notify UI
+                            notifyStatusChanged("Seek failed: " + e.getMessage());
                         }
                     }
                     // Clear queues and reset state
@@ -283,6 +303,8 @@ public class FramePipeline implements AutoCloseable {
                     playbackStartNs = System.nanoTime();
                     logicalPlaybackBaseUs = seekTimestampUs;
                     pauseStartedNs = 0;
+                    // Give processor threads time to see seekRequested and exit
+                    try { Thread.sleep(20); } catch (InterruptedException ignored) {}
                     continue;
                 }
 
@@ -292,14 +314,16 @@ public class FramePipeline implements AutoCloseable {
                 }
 
                 Frame frame = audioAvailable ? grabber.grab() : grabber.grabImage();
+                System.err.println("[Decoder] Got frame: " + (frame != null) + ", image=" + (frame != null && frame.image != null) + ", samples=" + (frame != null && frame.samples != null));
                 if (frame == null) {
                     finishPlayback(); // EOF
                     break;
                 }
+                frameCount++;
 
                 long timestampUs = grabber.getTimestamp();
 
-                if (audioAvailable && frame.samples != null) {
+                if (audioAvailable && frame.samples != null && audioOutputEnabled.get()) {
                     byte[] samples = audioPlayer.copySamples(frame);
                     if (samples.length > 0) {
                         try {
@@ -359,8 +383,17 @@ public class FramePipeline implements AutoCloseable {
     private void runProcessor() {
         try {
             while (running.get() && !Thread.currentThread().isInterrupted()) {
+                if (seekRequested.get()) {
+                    // Clear any frames we're holding
+                    return;
+                }
                 PipelineFrame pf = decodeQueue.take(); // Blocks until frame available
                 if (!running.get()) break;
+
+                if (seekRequested.get()) {
+                    // Seek happened while we were waiting, discard this frame
+                    continue;
+                }
 
                 Frame frame = pf.frame();
                 InfoFrame info = pf.info();
@@ -448,6 +481,10 @@ public class FramePipeline implements AutoCloseable {
     private void pumpUI(long now) {
         if (!running.get()) {
             return;
+        }
+
+        if (paused.get()) {
+            return; // Don't display frames when paused
         }
 
         PipelineFrame ready = processQueue.peek(); // Non-blocking, don't remove

@@ -50,6 +50,10 @@ public class VideoPlayerModel {
         pipeline.play(file);
     }
 
+    public void play() {
+        pipeline.play();
+    }
+
     public void startOver() {
         pipeline.startOver();
     }
