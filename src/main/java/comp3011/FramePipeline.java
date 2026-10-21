@@ -48,7 +48,7 @@ public class FramePipeline implements AutoCloseable {
     // Inter-stage queues (thread-safe)
     private final BlockingQueue<PipelineFrame> decodeQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private final BlockingQueue<PipelineFrame> processQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
-    private final Queue<PendingAudio> pendingAudio = new ArrayDeque<>();  // Unbounded - audio frames are small
+    private final BlockingQueue<PendingAudio> pendingAudio = new LinkedBlockingQueue<>(50); // Bounded - backpressure on decoder
 
     // Pipeline configuration (injected at construction)
     private final List<FrameProcessor> frameProcessors;              // Effect chain to apply per frame
@@ -269,6 +269,8 @@ public class FramePipeline implements AutoCloseable {
                     processQueue.clear();
                     pendingAudio.clear();
                     flushAudioOutput();
+                    // Drain any remaining audio to avoid blocking on put()
+                    pendingAudio.clear();
                     seekRequested.set(false);
                     // Reset clock for new position
                     firstTimestampUs = -1;
@@ -294,7 +296,11 @@ public class FramePipeline implements AutoCloseable {
                 if (audioAvailable && frame.samples != null) {
                     byte[] samples = audioPlayer.copySamples(frame);
                     if (samples.length > 0) {
-                        pendingAudio.add(new PendingAudio(timestampUs, samples));
+                        try {
+                            pendingAudio.put(new PendingAudio(timestampUs, samples)); // Blocks if queue full
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
                 }
 
