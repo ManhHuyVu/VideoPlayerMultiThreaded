@@ -62,6 +62,7 @@ public class FramePipeline implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(false);   // Pipeline active
     private final AtomicBoolean paused = new AtomicBoolean(false);    // User pause requested
     private final AtomicBoolean seekRequested = new AtomicBoolean(false); // Seek in progress
+    private final AtomicBoolean audioOutputEnabled = new AtomicBoolean(true); // Audio mute state
     private long seekTimestampUs = -1;                                // Target seek position (microseconds)
 
     // Media resources (initialized in openResources())
@@ -148,11 +149,15 @@ public class FramePipeline implements AutoCloseable {
     }
 
     public void toggleAudioOutput() {
-        // Audio output toggle handled by model level
+        boolean newState = !audioOutputEnabled.getAndSet(!audioOutputEnabled.get());
+        if (!newState) {
+            flushAudioOutput(); // Clear buffer when muting
+        }
+        notifyAudioOutputStateChanged(); // Notify UI to update button
     }
 
     public boolean isAudioOutputEnabled() {
-        return true; // Default, Model delegates here
+        return audioOutputEnabled.get();
     }
 
     public void stop() {
@@ -186,6 +191,7 @@ public class FramePipeline implements AutoCloseable {
         playbackStartNs = System.nanoTime(); // Set clock start immediately
         pauseStartedNs = initiallyPaused ? System.nanoTime() : 0;
         frameProcessorsInitialised = false;
+        audioOutputEnabled.set(true); // Default to enabled
 
         notifyStatusChanged(videoFile.getName());
 
@@ -400,8 +406,8 @@ public class FramePipeline implements AutoCloseable {
     private void runAudio() {
         try {
             while (running.get() && !Thread.currentThread().isInterrupted()) {
-                if (paused.get() || firstTimestampUs == -1 || playbackStartNs <= 0) {
-                    Thread.sleep(5); // Wait for clock init
+                if (paused.get() || firstTimestampUs == -1 || playbackStartNs <= 0 || !audioOutputEnabled.get()) {
+                    Thread.sleep(5); // Wait for clock init or audio enabled
                     continue;
                 }
 
@@ -553,6 +559,9 @@ public class FramePipeline implements AutoCloseable {
     }
     private void notifyStatusChanged(String status) { statusChangedHandler.accept(status); }
     private void notifyVideoSizeChanged(int width, int height) { videoSizeChangedHandler.accept(width, height); }
+    private void notifyAudioOutputStateChanged() {
+        audioOutputStateChangedHandler.accept(audioOutputEnabled.get());
+    }
     private void initialiseFrameProcessors(InfoVideo videoInfo) throws Exception {
         for (FrameProcessor processor : frameProcessors) {
             processor.initialise(videoInfo);

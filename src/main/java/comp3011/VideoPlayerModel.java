@@ -71,7 +71,7 @@ public class VideoPlayerModel {
     }
 
     public boolean isAudioOutputEnabled() {
-        return true;
+        return pipeline.isAudioOutputEnabled();
     }
 
     public void stopPlayback() {
