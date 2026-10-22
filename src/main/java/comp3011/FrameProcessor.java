@@ -28,6 +28,16 @@ import org.bytedeco.javacv.Frame;
  * conditions, frame overwrites or frame tearing etc. Some helper methods are provided
  * for this.
  * </p>
+ *
+ * <p>
+ * <b>Thread-safety:</b> Multiple processor threads call {@link #process(Frame, InfoFrame)}
+ * concurrently on the <b>same effect instance</b>. Implementations must be thread-safe:
+ * <ul>
+ *   <li>Do not mutate shared state in {@code process()}.</li>
+ *   <li>Use only local variables and {@code videoInfo} (immutable after {@code initialise()}).</li>
+ *   <li>If per-frame state is needed, use {@code ThreadLocal} or compute from frame number.</li>
+ * </ul>
+ * </p>
  */
 public abstract class FrameProcessor {
     protected InfoVideo videoInfo;

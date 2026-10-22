@@ -47,6 +47,7 @@ public class VideoPlayerController {
                 this::onPlaybackStateChanged,
                 this::onAudioOutputStateChanged);
 
+        // Wire view buttons -> model actions
         view.getStartOverButton().setOnAction(_ -> startOver());
         view.getBackFiveButton().setOnAction(_ -> backFiveSeconds());
         view.getPausePlayButton().setOnAction(_ -> togglePause());
@@ -65,13 +66,13 @@ public class VideoPlayerController {
                 togglePause();
                 event.consume();
             } else if (event.getCode() == KeyCode.LEFT) {
-                backFiveSeconds();
+                backFiveSeconds(); // Seek -5s
                 event.consume();
             } else if (event.getCode() == KeyCode.RIGHT) {
-                forwardFiveSeconds();
+                forwardFiveSeconds(); // Seek +5s
                 event.consume();
             } else if (event.getCode() == KeyCode.HOME) {
-                startOver();
+                startOver(); // Restart
                 event.consume();
             } else if (event.getCode() == KeyCode.A) {
                 toggleAudioOutput();
@@ -87,6 +88,10 @@ public class VideoPlayerController {
     public void play(File file) {
         view.setPlaybackControlsDisabled(false);
         model.play(file);
+    }
+
+    public void resume() {
+        model.play();
     }
 
     public void shutdown() {

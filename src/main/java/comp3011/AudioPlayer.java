@@ -11,6 +11,7 @@
 package comp3011;
 
 import java.nio.Buffer;
+import java.nio.FloatBuffer;
 import java.nio.ShortBuffer;
 
 import javax.sound.sampled.AudioFormat;
@@ -150,6 +151,29 @@ public class AudioPlayer implements AutoCloseable {
             return copyPackedSamples(source);
         }
 
+        if (samples[0] instanceof FloatBuffer floatPackedSamples) {
+            FloatBuffer source = floatPackedSamples.duplicate();
+            ensureOutputBufferCapacity(source.remaining() * Short.BYTES);
+            return copyPackedFloatSamples(source);
+        }
+
+        if (channels > 1 && samples.length == channels && samples[0] instanceof FloatBuffer) {
+            FloatBuffer[] planarSamples = new FloatBuffer[channels];
+            int sampleCount = Integer.MAX_VALUE;
+
+            for (int channel = 0; channel < channels; channel++) {
+                if (!(samples[channel] instanceof FloatBuffer channelSamples)) {
+                    return 0;
+                }
+                planarSamples[channel] = channelSamples.duplicate();
+                sampleCount = Math.min(sampleCount, planarSamples[channel].remaining());
+            }
+
+            ensureOutputBufferCapacity(sampleCount * channels * Short.BYTES);
+            return copyPlanarFloatSamples(planarSamples, sampleCount);
+        }
+
+        System.err.println("AudioPlayer: Unsupported sample format " + samples[0].getClass().getSimpleName());
         return 0;
     }
 
@@ -170,6 +194,30 @@ public class AudioPlayer implements AutoCloseable {
                 short sample = channelSamples.get();
                 outputBuffer[outputIndex++] = (byte) (sample & 0xff);
                 outputBuffer[outputIndex++] = (byte) ((sample >> 8) & 0xff);
+            }
+        }
+        return outputIndex;
+    }
+
+    private int copyPackedFloatSamples(FloatBuffer source) {
+        int outputIndex = 0;
+        while (source.hasRemaining()) {
+            float sample = source.get();
+            short s = (short) Math.max(-32768, Math.min(32767, Math.round(sample * 32767.0f)));
+            outputBuffer[outputIndex++] = (byte) (s & 0xff);
+            outputBuffer[outputIndex++] = (byte) ((s >> 8) & 0xff);
+        }
+        return outputIndex;
+    }
+
+    private int copyPlanarFloatSamples(FloatBuffer[] planarSamples, int sampleCount) {
+        int outputIndex = 0;
+        for (int sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
+            for (FloatBuffer channelSamples : planarSamples) {
+                float sample = channelSamples.get();
+                short s = (short) Math.max(-32768, Math.min(32767, Math.round(sample * 32767.0f)));
+                outputBuffer[outputIndex++] = (byte) (s & 0xff);
+                outputBuffer[outputIndex++] = (byte) ((s >> 8) & 0xff);
             }
         }
         return outputIndex;
