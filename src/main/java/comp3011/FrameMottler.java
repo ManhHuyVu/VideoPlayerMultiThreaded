@@ -37,6 +37,7 @@ public class FrameMottler extends FrameProcessor {
     private static final double LARGE_MOTTLE_WEIGHT = 0.30;
     private static final int DAMAGE_MASK_BLEND_FRAMES = 72;
     private static final int DAMAGE_MASK_SMOOTHING_PASSES = 13;
+    private static final int NOISE_FIELD_CACHE_SIZE = 60; // Cache last 60 frames (~2.5s at 24fps)
     private static final double DAMAGE_MASK_THRESHOLD = 0.55;
     private static final int EFFECT_BLOCK_SIZE = 4;
     private static final int SCALE_LOOKUP_SIZE = 512;
@@ -58,9 +59,9 @@ public class FrameMottler extends FrameProcessor {
 
     private final int instanceIndex;
     private int mediaSeed;
-    private int cachedDamageMaskSegment = Integer.MIN_VALUE;
-    private double[] damageMaskA;
-    private double[] damageMaskB;
+    private volatile int cachedDamageMaskSegment = Integer.MIN_VALUE;
+    private volatile double[] damageMaskA;
+    private volatile double[] damageMaskB;
     private int[] xGridLeft;
     private double[] xGridBlend;
     private int[] yGridTop;
@@ -71,6 +72,22 @@ public class FrameMottler extends FrameProcessor {
     private int blockBlueScaleIndex;
     private int blockGreenScaleIndex;
     private int blockRedScaleIndex;
+
+    // Thread-local cache so processor threads never touch each other's noise fields
+    private static final class FieldCache {
+        final double[][] brightness = new double[NOISE_FIELD_CACHE_SIZE][];
+        final double[][] stain = new double[NOISE_FIELD_CACHE_SIZE][];
+        final int[] frameNumbers = new int[NOISE_FIELD_CACHE_SIZE];
+        int head = 0;
+
+        FieldCache() {
+            for (int i = 0; i < NOISE_FIELD_CACHE_SIZE; i++) {
+                frameNumbers[i] = -1;
+            }
+        }
+    }
+
+    private final ThreadLocal<FieldCache> fieldCacheLocal = ThreadLocal.withInitial(FieldCache::new);
 
     public FrameMottler() {
         super();
@@ -83,6 +100,10 @@ public class FrameMottler extends FrameProcessor {
         mediaSeed = saltedMediaSeed(videoInfo.mediaName(), instanceIndex + SEED_SALT);
         buildSamplingLookups();
         buildScaleLookups();
+        // Pre-initialize damage masks so they're never null on first process() call
+        damageMaskA = buildNoiseField(0, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
+        damageMaskB = buildNoiseField(1, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
+        cachedDamageMaskSegment = 0;
     }
 
     @Override
@@ -103,13 +124,31 @@ public class FrameMottler extends FrameProcessor {
             throw new Exception("FrameMottler requires at least three image channels");
         }
 
-        double[] brightnessField = buildMultiScaleNoiseField(info.frameNumber(), BRIGHTNESS_FIELD_SALT);
-        double[] stainField = buildMultiScaleNoiseField(info.frameNumber(), STAIN_FIELD_SALT);
+        double[] brightnessField = getCachedField(true, info.frameNumber(), BRIGHTNESS_FIELD_SALT);
+        double[] stainField = getCachedField(false, info.frameNumber(), STAIN_FIELD_SALT);
         int damageMaskSegment = info.frameNumber() / DAMAGE_MASK_BLEND_FRAMES;
         double damageMaskBlend = (info.frameNumber() % DAMAGE_MASK_BLEND_FRAMES) / (double) DAMAGE_MASK_BLEND_FRAMES;
         ensureDamageMaskFields(damageMaskSegment);
 
         mottleFrame(pixels, brightnessField, stainField, damageMaskBlend);
+    }
+
+    private double[] getCachedField(boolean isBrightness, int frameNumber, int fieldSalt) {
+        FieldCache cache = fieldCacheLocal.get();
+        int[] frameNumbers = cache.frameNumbers;
+        double[][] store = isBrightness ? cache.brightness : cache.stain;
+
+        for (int i = 0; i < NOISE_FIELD_CACHE_SIZE; i++) {
+            if (frameNumbers[i] == frameNumber && store[i] != null) {
+                return store[i];
+            }
+        }
+
+        double[] field = buildMultiScaleNoiseField(frameNumber, fieldSalt);
+        store[cache.head] = field;
+        frameNumbers[cache.head] = frameNumber;
+        cache.head = (cache.head + 1) % NOISE_FIELD_CACHE_SIZE;
+        return field;
     }
 
     private void buildSamplingLookups() {
@@ -175,10 +214,14 @@ public class FrameMottler extends FrameProcessor {
         if (segment == cachedDamageMaskSegment) {
             return;
         }
-
-        cachedDamageMaskSegment = segment;
-        damageMaskA = buildNoiseField(segment, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
-        damageMaskB = buildNoiseField(segment + 1, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
+        synchronized (this) {
+            if (segment == cachedDamageMaskSegment) {
+                return;
+            }
+            cachedDamageMaskSegment = segment;
+            damageMaskA = buildNoiseField(segment, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
+            damageMaskB = buildNoiseField(segment + 1, DAMAGE_MASK_SALT, DAMAGE_MASK_SMOOTHING_PASSES);
+        }
     }
 
     private double[] buildMultiScaleNoiseField(int frameNumber, int fieldSalt) {

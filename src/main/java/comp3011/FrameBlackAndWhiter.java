@@ -13,7 +13,6 @@ package comp3011;
 import java.nio.ByteBuffer;
 
 import org.bytedeco.javacv.Frame;
-
 /**
  * Converts colour frames to greyscale.
  *
