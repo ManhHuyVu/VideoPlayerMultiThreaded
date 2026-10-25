@@ -31,6 +31,8 @@ public class FrameYellower extends FrameProcessor {
     private byte[] redLookup;
     private byte[] greenLookup;
     private byte[] blueLookup;
+    private final ThreadLocal<byte[]> localPixelsBuffer =
+        ThreadLocal.withInitial(() -> new byte[videoInfo.imageStride() * videoInfo.imageHeight()]);
 
     public FrameYellower() {
         super();
@@ -118,18 +120,28 @@ public class FrameYellower extends FrameProcessor {
         int width = videoInfo.imageWidth();
         int channels = videoInfo.imageChannels();
         int stride = videoInfo.imageStride();
+        int frameBytes = stride * height;
+
+        byte[] local = localPixelsBuffer.get();
+
+        ByteBuffer source = pixels.duplicate();
+        source.clear();
+        source.get(local, 0, frameBytes);
 
         for (int y = 0; y < height; y++) {
             int rowStart = y * stride;
             for (int x = 0; x < width; x++) {
                 int base = rowStart + x * channels;
-                // JavaCV supplies these decoded frames in BGR byte order.
-                pixels.put(base, blueLookup[Byte.toUnsignedInt(pixels.get(base))]);
-                pixels.put(base + 1, greenLookup[Byte.toUnsignedInt(pixels.get(base + 1))]);
-                pixels.put(base + 2, redLookup[Byte.toUnsignedInt(pixels.get(base + 2))]);
+                local[base]     = blueLookup[local[base] & 0xFF];
+                local[base + 1] = greenLookup[local[base + 1] & 0xFF];
+                local[base + 2] = redLookup[local[base + 2] & 0xFF];
             }
-        }
     }
+
+    ByteBuffer destination = pixels.duplicate();
+    destination.clear();
+    destination.put(local, 0, frameBytes);
+}
 
     private int clamp(int value, int min, int max) {
         return Math.max(min, Math.min(value, max));
