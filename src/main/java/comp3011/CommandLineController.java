@@ -29,6 +29,7 @@ public class CommandLineController {
     private boolean helpRequested;
     private boolean audioRequested;
     private boolean maximiseRequested;
+    private boolean subtitleFramesRequested;
     private Integer displayId;
     private File videoFile;
     private String errorMessage;
@@ -67,6 +68,10 @@ public class CommandLineController {
 
     public boolean isMaximiseRequested() {
         return maximiseRequested;
+    }
+
+    public boolean isSubtitleFramesRequested() {
+        return subtitleFramesRequested;
     }
 
     public boolean shouldLaunchApplication() {
@@ -149,6 +154,10 @@ public class CommandLineController {
             case "--pepper-frames":
                 frameProcessors.add(new FramePepperer());
                 break;
+            case "--subtitle-frames":
+                subtitleFramesRequested = true;
+                frameProcessors.add(new SubtitleFrameProcessor());
+                break;
             default:
                 errorMessage = "Unknown option: " + arg;
         }
@@ -191,6 +200,10 @@ public class CommandLineController {
                 case 'p':
                     frameProcessors.add(new FramePepperer());
                     break;
+                case 'S':
+                    subtitleFramesRequested = true;
+                    frameProcessors.add(new SubtitleFrameProcessor());
+                    break;
                 default:
                     errorMessage = "Unknown option: -" + c;
             }
@@ -231,6 +244,7 @@ public class CommandLineController {
         System.out.println("  -m, --mottle-frames    Add cloudy emulsion mottling");
         System.out.println("  -b, --bleed-frames     Bleed light into frames");
         System.out.println("  -p, --pepper-frames    Pepper frames with dark spots/blotches");
+        System.out.println("  -S, --subtitle-frames  Render speech-to-text subtitles onto frames");
         System.out.println("Frame processors are applied in command-line order and may be repeated.");
         System.out.println("Example: -nssnfwyvdjmbp numbers, scratches twice, numbers again, flickers,");
         System.out.println("converts, warms, vignettes, dusts, jitters, mottles, bleeds, then peppers.");

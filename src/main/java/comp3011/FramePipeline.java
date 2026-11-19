@@ -16,8 +16,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -387,8 +389,25 @@ public class FramePipeline implements AutoCloseable {
 
                 PipelineFrame pf = new PipelineFrame(clonedFrame, frameNumber, timestampUs, info, seekGeneration.get());
 
-                // Submit to processor executor; processed frame goes directly into processQueue
-                processorExecutor.submit(() -> processFrame(pf));
+                // Submit to processor executor and put the processed frame into
+                // processQueue in submission order so pumpUI can display it.
+                // Blocking on the future serializes display order while keeping
+                // frame processing itself parallel across the executor pool.
+                Future<PipelineFrame> future = processorExecutor.submit(() -> processFrame(pf));
+                PipelineFrame result;
+                try {
+                    result = future.get(); // throws InterruptedException on shutdown
+                } catch (ExecutionException e) {
+                    throw new Exception("Frame processing failed", e.getCause());
+                }
+                if (result != null) {
+                    try {
+                        processQueue.put(result); // backpressure if queue is full
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -495,7 +514,14 @@ public class FramePipeline implements AutoCloseable {
             }
             // Frame from the future - wait for expected frame to arrive
             if (ready.frameNumber() > expectedFrameNumber) {
-                break;
+                // The first decoded frame may not be number 0 (e.g. FFmpeg starts
+                // at 1, or an audio-only frame was skipped). Accept it and start
+                // counting from there.
+                if (framesProcessed.get() == 0 && expectedFrameNumber == 0) {
+                    expectedFrameNumber = ready.frameNumber();
+                } else {
+                    break;
+                }
             }
             long latenessNs = now - ready.targetTimeNs();
             if (latenessNs > LATE_FRAME_THRESHOLD_NS) {

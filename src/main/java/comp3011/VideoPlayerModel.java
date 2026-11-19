@@ -74,6 +74,14 @@ public class VideoPlayerModel {
         pipeline.toggleAudioOutput();
     }
 
+    public void toggleSubtitles() {
+        SubtitleService.get().toggleEnabled();
+    }
+
+    public boolean isSubtitleEnabled() {
+        return SubtitleService.get().isEnabled();
+    }
+
     public boolean isAudioOutputEnabled() {
         return pipeline.isAudioOutputEnabled();
     }

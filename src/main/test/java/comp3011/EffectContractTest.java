@@ -40,7 +40,8 @@ class EffectContractTest {
                 new ProcessorCase("FrameJitterer", FrameJitterer::new, 1),
                 new ProcessorCase("FrameBleeder", FrameBleeder::new, 3),
                 new ProcessorCase("FramePepperer", FramePepperer::new, 1),
-                new ProcessorCase("FrameMottler", FrameMottler::new, 3));
+                new ProcessorCase("FrameMottler", FrameMottler::new, 3),
+                new ProcessorCase("SubtitleFrameProcessor", SubtitleFrameProcessor::new, 1));
     }
 
     @ParameterizedTest(name = "{0} ignores a null image")

@@ -10,6 +10,7 @@
  */
 package comp3011;
 
+import java.io.File;
 import java.util.List;
 
 import javafx.application.Application;
@@ -38,10 +39,27 @@ public class VideoPlayerApp extends Application {
     private Rectangle2D selectedScreenBounds;
     private int videoWidth;
     private int videoHeight;
+    private SubtitleService subtitleService;
 
     @Override
     public void start(Stage stage) {
         this.stage = stage;
+
+        // Embedded subtitle API (localhost:8080). Published so the subtitle frame
+        // processor and controller can reach it via SubtitleService.get().
+        try {
+            subtitleService = new SubtitleService(SubtitleService.PORT);
+            subtitleService.start();
+        } catch (Exception e) {
+            // Port already in use or otherwise unavailable: playback continues
+            // without subtitles rather than failing to launch.
+            subtitleService = null;
+            System.err.println("Subtitle server unavailable: " + e.getMessage());
+        }
+        if (subtitleService != null) {
+            SubtitleService.set(subtitleService);
+            subtitleService.setEnabled(commandLineController.isSubtitleFramesRequested());
+        }
 
         controller = new VideoPlayerController(
                 commandLineController.isAudioRequested(),
@@ -88,7 +106,22 @@ public class VideoPlayerApp extends Application {
     }
 
     private void playVideo() {
+        if (subtitleService != null) {
+            subtitleService.setMediaFile(commandLineController.getVideoFile());
+            // Start fetching subtitles early so they're ready before the first
+            // frames are rendered. Transcription takes time; kicking it off here
+            // (before the pipeline starts) maximizes the chance segments are
+            // cached by the time subtitle-bearing frames need to display.
+            subtitleService.ensureSegments(mediaName(commandLineController.getVideoFile()));
+        }
         controller.play(commandLineController.getVideoFile());
+    }
+
+    private String mediaName(File file) {
+        String fileName = file.getName();
+        int extensionStart = fileName.lastIndexOf('.');
+        if (extensionStart <= 0) return fileName;
+        return fileName.substring(0, extensionStart);
     }
 
     private void setVideoSize(int width, int height) {
@@ -133,6 +166,9 @@ public class VideoPlayerApp extends Application {
 
     @Override
     public void stop() {
+        if (subtitleService != null) {
+            subtitleService.stop();
+        }
         if (controller != null) {
             controller.shutdown();
         }

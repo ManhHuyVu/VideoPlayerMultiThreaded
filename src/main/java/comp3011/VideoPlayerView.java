@@ -57,6 +57,7 @@ public class VideoPlayerView {
     private final Button forwardFiveButton;
     private final Button stopButton;
     private final Button audioButton;
+    private final Button subtitleButton;
 
     public VideoPlayerView() {
         imageView.setPreserveRatio(true);
@@ -66,8 +67,8 @@ public class VideoPlayerView {
         videoPane.setStyle("-fx-background-color: black;");
         videoPane.setMinSize(0, 0);
         videoPane.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
-        imageView.fitWidthProperty().bind(videoPane.widthProperty());
-        imageView.fitHeightProperty().bind(videoPane.heightProperty());
+        imageView.setFitWidth(0);
+        imageView.setFitHeight(0);
 
         startOverButton = iconButton(createLoopIcon(false, null));
         backFiveButton = iconButton(createLoopIcon(false, "5"));
@@ -75,6 +76,7 @@ public class VideoPlayerView {
         forwardFiveButton = iconButton(createLoopIcon(true, "5"));
         stopButton = iconButton(createStopIcon());
         audioButton = iconButton(createAudioIcon(false));
+        subtitleButton = iconButton(createSubtitleIcon(false));
         setPlaybackControlsDisabled(true);
 
         HBox controls = new HBox(
@@ -85,6 +87,7 @@ public class VideoPlayerView {
                 forwardFiveButton,
                 stopButton,
                 audioButton,
+                subtitleButton,
                 statusLabel);
 
         controls.setPadding(new Insets(10));
@@ -127,6 +130,10 @@ public class VideoPlayerView {
         return audioButton;
     }
 
+    public Button getSubtitleButton() {
+        return subtitleButton;
+    }
+
     public void setStatus(String status) {
         statusLabel.setText(status);
     }
@@ -137,6 +144,8 @@ public class VideoPlayerView {
 
     public void setVideoDisplaySize(double width, double height) {
         videoPane.setPrefSize(width, height);
+        imageView.setFitWidth(width);
+        imageView.setFitHeight(height);
     }
 
     public void showPauseAction() {
@@ -151,6 +160,10 @@ public class VideoPlayerView {
         audioButton.setGraphic(createAudioIcon(audioEnabled));
     }
 
+    public void setSubtitleEnabled(boolean subtitleEnabled) {
+        subtitleButton.setGraphic(createSubtitleIcon(subtitleEnabled));
+    }
+
     public void setPlaybackControlsDisabled(boolean disabled) {
         startOverButton.setDisable(disabled);
         backFiveButton.setDisable(disabled);
@@ -158,6 +171,7 @@ public class VideoPlayerView {
         forwardFiveButton.setDisable(disabled);
         stopButton.setDisable(disabled);
         audioButton.setDisable(disabled);
+        subtitleButton.setDisable(disabled);
     }
 
     // There are a bunch of tooltip handling methods starting from here. We want to use tooltips so that people with
@@ -169,6 +183,7 @@ public class VideoPlayerView {
         setButtonTooltip(forwardFiveButton, "[RIGHT]");
         setButtonTooltip(stopButton, "[ESC]");
         setButtonTooltip(audioButton, "[A]");
+        setButtonTooltip(subtitleButton, "[S]");
     }
 
     private void setButtonTooltip(Button button, String text) {
@@ -356,5 +371,22 @@ public class VideoPlayerView {
         line.setStrokeWidth(2.0);
         line.setStrokeLineCap(StrokeLineCap.ROUND);
         return line;
+    }
+
+    // A small block of text lines for subtitles on; crossed out for subtitles off.
+    private Canvas createSubtitleIcon(boolean subtitleEnabled) {
+        Canvas canvas = new Canvas(ICON_SIZE, ICON_SIZE);
+        GraphicsContext gc = canvas.getGraphicsContext2D();
+        gc.setFill(Color.BLACK);
+        // Three lines of "text".
+        gc.fillRect(8, 10, 14, 2);
+        gc.fillRect(8, 14, 10, 2);
+        gc.fillRect(8, 18, 12, 2);
+        if (!subtitleEnabled) {
+            gc.setStroke(Color.BLACK);
+            gc.setLineWidth(2.0);
+            gc.strokeLine(7, 8, 23, 22);
+        }
+        return canvas;
     }
 }
